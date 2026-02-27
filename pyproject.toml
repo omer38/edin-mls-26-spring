@@ -7,7 +7,7 @@ dependencies = [
     "torch",
     "numpy",
     "triton",
-    "cupy",
+    "cupy-cuda12x",
     "datasets",
 ]
 
