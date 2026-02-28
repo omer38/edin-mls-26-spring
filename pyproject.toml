@@ -9,6 +9,8 @@ dependencies = [
     "triton",
     "cupy-cuda12x",
     "datasets",
+    "transformers",
+    "accelerate",
 ]
 
 [tool.uv]
