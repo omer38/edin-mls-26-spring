@@ -124,9 +124,13 @@ def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     # Step 1: Load input tile
     # Step 2: Compute tanh approximation
     # Step 3: Store output
-
-    # YOUR CODE HERE
+    
+    offs = pid * BLOCK_SIZE + tl.arange(0,BLOCK_SIZE)
+    mask = offs < n_elements
+    x = tl.load(x_ptr + offs, mask = mask, other=0.0)
     pass
+    
+
 
 
 @triton.jit
@@ -146,8 +150,13 @@ def silu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     # Step 2: Compute sigmoid
     # Step 3: Multiply and store
 
-    # YOUR CODE HERE
-    pass
+    offs = pid * BLOCK_SIZE + tl.arange(0,BLOCK_SIZE)
+    mask = offs < n_elements
+    x = tl.load(x_ptr + offs, mask = mask, other = 0.0)
+    sigmoid = 1.0 / (1.0 + tl.exp(-x))
+    y = x * sigmoid
+    tl.store(y_ptr + offs, y, mask = mask)
+    
 
 
 @triton.jit
