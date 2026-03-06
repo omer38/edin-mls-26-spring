@@ -508,12 +508,13 @@ class RMSNorm:
         self.hidden_size = hidden_size
         self.eps = eps
         self.weight = torch.ones(hidden_size, dtype=torch.float32)
-        self.use_triton = _is_power_of_two(hidden_size)
+        self.use_triton = _is_power_of_two(hidden_size) # This flag will force a fallback to a PyTorch implementation of the kernels when the hidden_size is not a power of 2.
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         original_shape = x.shape
 
-        if self.use_triton and x.is_cuda:
+       
+        if self.use_triton and x.is_cuda:  # remove self.use_triton flag from this if-statement in case you want to always run your Triton kernel regardless of whether hidden_size is a power of 2.
             batch_size = int(np.prod(x.shape[:-1]))
             x_flat = x.reshape(batch_size, self.hidden_size).contiguous()
             x_flat = x_flat.to(torch.float32)
@@ -551,12 +552,12 @@ class LayerNorm:
         self.eps = eps
         self.weight = torch.ones(hidden_size, dtype=torch.float32)
         self.bias = torch.zeros(hidden_size, dtype=torch.float32)
-        self.use_triton = _is_power_of_two(hidden_size)
+        self.use_triton = _is_power_of_two(hidden_size)  # This flag will force a fallback to a PyTorch implementation of the kernels when the hidden_size is not a power of 2.
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         original_shape = x.shape
 
-        if self.use_triton and x.is_cuda:
+        if self.use_triton and x.is_cuda:  # remove self.use_triton flag from this if-statement in case you want to always run your Triton kernel regardless of whether hidden_size is a power of 2.
             batch_size = int(np.prod(x.shape[:-1]))
             x_flat = x.reshape(batch_size, self.hidden_size).contiguous()
             x_flat = x_flat.to(torch.float32)
