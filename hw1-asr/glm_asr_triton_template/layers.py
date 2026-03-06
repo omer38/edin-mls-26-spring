@@ -153,8 +153,9 @@ def silu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     offs = pid * BLOCK_SIZE + tl.arange(0,BLOCK_SIZE)
     mask = offs < n_elements
     x = tl.load(x_ptr + offs, mask = mask, other = 0.0)
-    sigmoid = 1.0 / (1.0 + tl.exp(-x))
-    y = x * sigmoid
+    x_f32 = x.to(tl.float32)
+    sigmoid = 1.0 / (1.0 + tl.exp(-x_f32))
+    y = x_f32 * sigmoid
     tl.store(y_ptr + offs, y, mask = mask)
     
 
