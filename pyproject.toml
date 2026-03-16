@@ -7,11 +7,13 @@ dependencies = [
     "torch",
     "numpy",
     "triton",
-    "cupy-cuda12x",
     "datasets",
     "transformers",
     "accelerate",
 ]
 
-[tool.uv]
-dev-dependencies = []
+[dependency-groups]
+gpu = [
+    "cupy-cuda12x",
+]
+dev = []
