@@ -112,8 +112,18 @@ def layernorm_kernel(
     # Step 5: Normalize and apply affine transform
 
     # YOUR CODE HERE
-    pass
-
+    offs = tl.arange(0,BLOCK_SIZE)
+    mask = offs < hidden_size
+    x = tl.load(x_ptr + pid * stride_x + offs, mask = mask, other = 0.0)
+    w = tl.load(w_ptr + offs, mask = mask, other = 0.0)
+    b = tl.load(b_ptr + offs, mask = mask, other = 0.0)
+    x_f32 = x.to(tl.float32)
+    x_mean = tl.sum(x_f32,axis=0) / hidden_size
+    x_centered = x_f32 - x_mean
+    x_var = tl.sum(x_centered * x_centered, axis=0) / hidden_size
+    x_norm = x_centered * tl.rsqrt(x_var + eps)
+    y = x_norm * w + b
+    tl.store(y_ptr + pid * stride_y + offs, y, mask=mask)
 
 @triton.jit
 def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
