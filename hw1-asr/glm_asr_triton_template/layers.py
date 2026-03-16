@@ -362,9 +362,14 @@ def softmax_kernel(x_ptr, y_ptr, stride_x, stride_y, n_cols, BLOCK_SIZE: tl.cons
     # Step 2: Subtract max for stability
     # Step 3: Compute exp and normalize
     # Step 4: Store output
-
     # YOUR CODE HERE
-    pass
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_cols
+    x = tl.load(x_ptr + row * stride_x + offs, mask=mask, other=-float("inf"))
+    x -= tl.max(x, axis=0) # For numerical stability
+    exp_x = tl.exp(x)
+    y = exp_x / tl.sum(exp_x, axis=0)
+    tl.store(y_ptr + row * stride_y + offs, y, mask=mask)
 
 
 @triton.jit
