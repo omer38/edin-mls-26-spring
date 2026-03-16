@@ -68,9 +68,16 @@ def rmsnorm_kernel(
     # Step 2: Compute variance = mean(x^2)
     # Step 3: Normalize: x / sqrt(variance + eps)
     # Step 4: Apply weight and store
-
     # YOUR CODE HERE
-    pass
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < hidden_size
+    x = tl.load(x_ptr + pid * stride_x + offs, mask=mask, other=0.0)
+    w = tl.load(w_ptr + offs, mask=mask, other=0.0)
+    x_f32 = x.to(tl.float32)
+    variance = tl.sum(x_f32 * x_f32, axis=0) / hidden_size
+    rnorm = x_f32 * tl.rsqrt(variance + eps)
+    y = rnorm * w
+    tl.store(y_ptr + pid * stride_y + offs, y, mask=mask)
 
 
 @triton.jit
