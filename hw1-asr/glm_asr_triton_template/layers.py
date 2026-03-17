@@ -147,7 +147,7 @@ def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     x = tl.load(x_ptr + offs, mask=mask, other=0.0)
     x_f32 = x.to(tl.float32)
     #sqrt(2/pi) =0.7978845608
-    inner = math.sqrt(2.0 / math.pi) * (x_f32 + 0.044715 * x_f32 * x_f32 * x_f32)
+    inner = tl.sqrt(2.0 / math.pi) * (x_f32 + 0.044715 * x_f32 * x_f32 * x_f32)
     # tl.libdevice.tanh(inner) didn't work so change it to tl.extra.cuda.libdevice.tanh(inner) like in the working example
     y = 0.5 * x_f32 * (1.0 + tl.extra.cuda.libdevice.tanh(inner))
     tl.store(y_ptr + offs, y, mask=mask)
