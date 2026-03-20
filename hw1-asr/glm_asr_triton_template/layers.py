@@ -14,6 +14,10 @@ import torch
 import triton
 import triton.language as tl
 
+# GELU element-wise kernel launch (tune with ../benchmark_tile_sizes.py, then set here)
+GELU_BLOCK_SIZE = 1024
+GELU_NUM_WARPS = 4
+
 
 # ============================================================================
 # Helper Functions
@@ -653,14 +657,20 @@ def gelu(x: torch.Tensor) -> torch.Tensor:
     """GELU activation using Triton."""
     original_shape = x.shape
     total = int(np.prod(x.shape))
-    block = 256
+    block = GELU_BLOCK_SIZE
 
     x_flat = x.reshape(-1).contiguous().to(torch.float32)
     output = torch.empty_like(x_flat)
     grid = (triton.cdiv(total, block),)
 
     if x.is_cuda:
-        gelu_kernel[grid](x_flat, output, total, BLOCK_SIZE=block)
+        gelu_kernel[grid](
+            x_flat,
+            output,
+            total,
+            BLOCK_SIZE=block,
+            num_warps=GELU_NUM_WARPS,
+        )
         return output[:total].reshape(original_shape).to(x.dtype)
 
     return torch.nn.functional.gelu(x)
@@ -670,7 +680,7 @@ def silu(x: torch.Tensor) -> torch.Tensor:
     """SiLU activation using Triton."""
     original_shape = x.shape
     total = int(np.prod(x.shape))
-    block = 256
+    block = 1024
 
     x_flat = x.reshape(-1).contiguous().to(torch.float32)
     output = torch.empty_like(x_flat)
@@ -697,6 +707,8 @@ class Linear:
     TILE_M = 64
     TILE_N = 64
     TILE_K = 32
+    NUM_WARPS = 4
+    NUM_STAGES = 3
 
     BACKEND = "torch"
 
@@ -813,6 +825,8 @@ class Linear:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            num_warps=self.NUM_WARPS,
+            num_stages=self.NUM_STAGES,
         )
 
         output = output[:M, :N]
@@ -902,7 +916,9 @@ class MLP:
     """MLP with SwiGLU gating using Triton."""
 
     FUSED = True
-    TILE_M, TILE_N, TILE_K = 64, 64, 32
+    TILE_M, TILE_N, TILE_K = 32, 64, 32
+    NUM_WARPS = 4
+    NUM_STAGES = 2
 
     def __init__(
         self,
@@ -1016,6 +1032,8 @@ class MLP:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            num_warps=self.NUM_WARPS,
+            num_stages=self.NUM_STAGES,
         )
 
         if M != M_pad or N != N_pad:
@@ -1029,7 +1047,9 @@ class EncoderMLP:
     """Encoder MLP (no gating) using Triton."""
 
     FUSED = True
-    TILE_M, TILE_N, TILE_K = 64, 64, 32
+    TILE_M, TILE_N, TILE_K = 128, 64, 32
+    NUM_WARPS = 4
+    NUM_STAGES = 3
 
     def __init__(
         self,
@@ -1119,6 +1139,8 @@ class EncoderMLP:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            num_warps=self.NUM_WARPS,
+            num_stages=self.NUM_STAGES,
         )
 
         if M != M_pad or N != N_pad:
