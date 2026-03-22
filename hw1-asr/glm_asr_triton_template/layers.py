@@ -216,6 +216,7 @@ def linear_kernel_tf32(
     a_ptr,
     b_ptr,
     c_ptr,
+    bias_ptr,
     M,
     N,
     K,
@@ -225,30 +226,24 @@ def linear_kernel_tf32(
     stride_bn,
     stride_cm,
     stride_cn,
+    HAS_BIAS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     """
-    TF32-style matmul: output = A @ B.
-    A: (M, K), B: (K, N), C: (M, N)
+    TF32-style matmul: output = A @ B (+ bias).
+    A: (M, K), B: (K, N), C: (M, N), bias: (N,) optional.
 
-    *** TODO: Implement this kernel ***
+    Bias fusion (Optimization 2): when HAS_BIAS=True the bias vector is added
+    to the accumulator before the store, eliminating the separate post-kernel
+    PyTorch bias-add and its associated global-memory read-write roundtrip.
 
-    Grid: (M // BLOCK_M, N // BLOCK_N)
+    Grid: (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    # ============================================================================
-    # TODO: Implement tiled matrix multiplication
-    # ============================================================================
-    #
-    # Step 1: Initialize accumulator
-    # Step 2: Loop over K tiles and accumulate tl.dot
-    # Step 3: Store the result
-
-    # YOUR CODE HERE
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
@@ -265,6 +260,12 @@ def linear_kernel_tf32(
         acc += tl.dot(a, b)
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
+
+    # Fused bias addition — executed entirely in registers before the store.
+    # When HAS_BIAS=False Triton eliminates this branch at compile time.
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+        acc += bias[None, :]
 
     mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
@@ -772,7 +773,12 @@ class Linear:
         return output.reshape(*batch_dims, self.out_features)
 
     def _forward_triton(self, x: torch.Tensor) -> torch.Tensor:
-        """Triton matmul backend. Autotuner selects the best tile config per (M,N,K)."""
+        """Triton matmul backend. Autotuner selects the best tile config per (M,N,K).
+
+        Bias fusion (Optimization 2): when the layer has a bias the bias vector
+        is passed directly into linear_kernel_tf32 and added in-register before
+        the store, so the output tensor is never read back just to add a vector.
+        """
         original_shape = x.shape
         batch_dims = original_shape[:-1]
 
@@ -787,6 +793,15 @@ class Linear:
             self._weight_t_padded = None
         self._ensure_weight_prepared()
 
+        # Prepare bias — move to device once, use output as a safe dummy when absent.
+        has_bias = self.has_bias and self.bias_param is not None
+        if has_bias:
+            if self.bias_param.device != x.device:
+                self.bias_param = self.bias_param.to(x.device)
+            bias_t = self.bias_param
+        else:
+            bias_t = x_2d  # dummy pointer — never dereferenced when HAS_BIAS=False
+
         output = torch.zeros((M, N), dtype=torch.float32, device=x.device)
 
         # Grid is a lambda: evaluated after autotuner selects the winning config
@@ -798,6 +813,7 @@ class Linear:
             x_2d,
             self._weight_t_padded,
             output,
+            bias_t,
             M, N, K,
             x_2d.stride(0),
             x_2d.stride(1),
@@ -805,13 +821,9 @@ class Linear:
             self._weight_t_padded.stride(1),
             output.stride(0),
             output.stride(1),
+            HAS_BIAS=has_bias,
             # BLOCK_M, BLOCK_N, BLOCK_K are injected by @triton.autotune — do not pass manually
         )
-
-        if self.has_bias and self.bias_param is not None:
-            if self.bias_param.device != x.device:
-                self.bias_param = self.bias_param.to(x.device)
-            output = output + self.bias_param
 
         return output.reshape(*batch_dims, self.out_features)
 
