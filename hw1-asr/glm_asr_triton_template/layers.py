@@ -40,6 +40,14 @@ def next_power_of_two(x: int) -> int:
 # Triton Kernels
 # ============================================================================
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16),
+    ],
+    key=['hidden_size'],
+)
 @triton.jit
 def rmsnorm_kernel(
     x_ptr,
@@ -80,6 +88,14 @@ def rmsnorm_kernel(
     tl.store(y_ptr + pid * stride_y + offs, y, mask=mask)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16),
+    ],
+    key=['hidden_size'],
+)
 @triton.jit
 def layernorm_kernel(
     x_ptr,
@@ -125,6 +141,14 @@ def layernorm_kernel(
     y = x_norm * w + b
     tl.store(y_ptr + pid * stride_y + offs, y, mask=mask)
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
+    ],
+    key=['n_elements'],
+)
 @triton.jit
 def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     """
@@ -155,6 +179,14 @@ def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
 
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8),
+    ],
+    key=['n_elements'],
+)
 @triton.jit
 def silu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     """
@@ -182,6 +214,14 @@ def silu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
+    ],
+    key=['M', 'N', 'K'],
+)
 @triton.jit
 def linear_kernel_tf32(
     a_ptr,
@@ -579,7 +619,6 @@ class RMSNorm:
             if self.weight.device != x.device:
                 self.weight = self.weight.to(x.device)
 
-            block = next_power_of_two(self.hidden_size)
             rmsnorm_kernel[(batch_size,)](
                 x_flat,
                 self.weight,
@@ -588,7 +627,6 @@ class RMSNorm:
                 output.stride(0),
                 self.hidden_size,
                 self.eps,
-                BLOCK_SIZE=block,
             )
             return output.reshape(original_shape)
 
@@ -624,7 +662,6 @@ class LayerNorm:
             if self.bias.device != x.device:
                 self.bias = self.bias.to(x.device)
 
-            block = next_power_of_two(self.hidden_size)
             layernorm_kernel[(batch_size,)](
                 x_flat,
                 self.weight,
@@ -634,7 +671,6 @@ class LayerNorm:
                 output.stride(0),
                 self.hidden_size,
                 self.eps,
-                BLOCK_SIZE=block,
             )
             return output.reshape(original_shape)
 
@@ -653,14 +689,13 @@ def gelu(x: torch.Tensor) -> torch.Tensor:
     """GELU activation using Triton."""
     original_shape = x.shape
     total = int(np.prod(x.shape))
-    block = 256
 
     x_flat = x.reshape(-1).contiguous().to(torch.float32)
     output = torch.empty_like(x_flat)
-    grid = (triton.cdiv(total, block),)
 
     if x.is_cuda:
-        gelu_kernel[grid](x_flat, output, total, BLOCK_SIZE=block)
+        grid = lambda meta: (triton.cdiv(total, meta['BLOCK_SIZE']),)
+        gelu_kernel[grid](x_flat, output, total)
         return output[:total].reshape(original_shape).to(x.dtype)
 
     return torch.nn.functional.gelu(x)
@@ -670,14 +705,13 @@ def silu(x: torch.Tensor) -> torch.Tensor:
     """SiLU activation using Triton."""
     original_shape = x.shape
     total = int(np.prod(x.shape))
-    block = 256
 
     x_flat = x.reshape(-1).contiguous().to(torch.float32)
     output = torch.empty_like(x_flat)
-    grid = (triton.cdiv(total, block),)
 
     if x.is_cuda:
-        silu_kernel[grid](x_flat, output, total, BLOCK_SIZE=block)
+        grid = lambda meta: (triton.cdiv(total, meta['BLOCK_SIZE']),)
+        silu_kernel[grid](x_flat, output, total)
         return output[:total].reshape(original_shape).to(x.dtype)
 
     return torch.nn.functional.silu(x)
@@ -694,8 +728,9 @@ def get_activation(name: str):
 class Linear:
     """Linear layer with switchable backend (torch or Triton)."""
 
-    TILE_M = 64
-    TILE_N = 64
+    # Max tile sizes across all autotune configs (used for padding)
+    TILE_M = 128
+    TILE_N = 128
     TILE_K = 32
 
     BACKEND = "torch"
@@ -793,9 +828,9 @@ class Linear:
             (M_padded, self._N_padded), dtype=torch.float32, device=x.device
         )
 
-        grid = (
-            triton.cdiv(M_padded, self.TILE_M),
-            triton.cdiv(self._N_padded, self.TILE_N),
+        grid = lambda meta: (
+            triton.cdiv(M_padded, meta['BLOCK_M']),
+            triton.cdiv(self._N_padded, meta['BLOCK_N']),
         )
         linear_kernel_tf32[grid](
             x_padded,
@@ -810,9 +845,6 @@ class Linear:
             self._weight_t_padded.stride(1),
             output.stride(0),
             output.stride(1),
-            BLOCK_M=self.TILE_M,
-            BLOCK_N=self.TILE_N,
-            BLOCK_K=self.TILE_K,
         )
 
         output = output[:M, :N]
