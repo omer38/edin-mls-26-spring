@@ -16,7 +16,8 @@
 | Reference example (fixed) | `glm_asr_triton_example/` — hardcoded tiles, unfused kernels | 1146.4 ms | baseline |
 | **Opt 1** applied | `layers.py`: `@triton.autotune` on matmul kernels | 1024.9 ms | −10.8% |
 | **Opt 1 + Opt 2** applied | `attention.py` + `layers.py`: kernel fusion | 992.0 ms | −13.5% |
-| **Opt 1 + Opt 2 + Opt 3** applied | `attention.py`: FlashAttention tiling | **751.4 ms** | **−34.5%** |
+| **Opt 1 + Opt 2 + Opt 3** applied | `attention.py`: FlashAttention tiling | 751.4 ms | −34.5% |
+| **Opt 1 + 2 + 3 + 4** applied | `layers.py` + `rope.py`: norm fix + Triton RoPE | **728.0 ms** | **−36.5%** |
 
 All runs: 100% transcription accuracy ("Concord returned to its place amidst the tents."), benchmark methodology: 1 warmup run + 3 timed runs on `test_audio.wav`.
 
@@ -362,21 +363,105 @@ Over 640 audio encoder attention calls (32 layers × 20 heads):
 | Reference example | 1146.4 ms |
 | After Opt 1 | 1024.9 ms (−10.8%) |
 | After Opt 1 + Opt 2 | 992.0 ms (−13.5%) |
-| **After Opt 1 + Opt 2 + Opt 3** | **751.4 ms (−34.5%)** |
+| After Opt 1 + Opt 2 + Opt 3 | 751.4 ms (−34.5%) |
+| **After Opt 1 + Opt 2 + Opt 3 + Opt 4** | **728.0 ms (−36.5%)** |
 
-Opt 3 alone contributed **−24.5%** on top of Opt 1+2.
+Opt 3 alone contributed **−24.5%** on top of Opt 1+2. Opt 4 contributed an additional **−3.1%**.
 
 ---
 
-## 5. Cumulative Summary
+## 5. Optimisation 4 — Triton Normalization + RoPE Rotation Kernel
+
+**Files changed:** `glm_asr_triton_template/layers.py`, `glm_asr_triton_template/rope.py`
+
+This optimisation is **applied on top of Opt 1, 2, and 3**.
+
+### The Problem: 13,400+ Hidden PyTorch Kernel Launches per Inference
+
+After Opt 3, every attention and matmul path ran through Triton. Two families of operations still dispatched to PyTorch on every inference:
+
+**Family 1 — Normalization**: The template guarded its Triton norm paths with
+`self.use_triton = _is_power_of_two(hidden_size)`. Both model hidden sizes — 1280
+(encoder) and 3584 (decoder) — are **not** powers of two, so **all 793 norm calls**
+per inference fell through to a 7-operation PyTorch chain:
+
+```python
+x.to(float32) → x*x → mean → rsqrt → multiply → weight_multiply → cast_back
+```
+
+793 calls × 7 ops = **5,551 micro-kernel launches** from normalization alone.
+
+**Family 2 — RoPE rotation**: `_apply_rope_single` used `torch.cat` and element-wise
+PyTorch operators. Called 792 times per inference (32 encoder + 28 × 13 decoder layers,
+twice for Q and K), each call executing ~10 PyTorch ops including a `torch.cat`
+allocation. Total: **~7,920 small PyTorch kernel launches** from RoPE alone.
+
+Combined: approximately **13,400 small CUDA kernel launches** per inference running in
+Python instead of Triton.
+
+### Fix 4a — Remove Non-Power-of-2 Guard (layers.py, 4 lines)
+
+The Triton kernels already used `BLOCK_SIZE = next_power_of_two(hidden_size)` with
+masking — they were correct for any hidden size. The guard was removed:
+
+```python
+# Before: if self.use_triton and x.is_cuda:
+# After:  if x.is_cuda:
+```
+
+793 norm calls now dispatch directly to the single Triton kernel, eliminating 5 PyTorch
+intermediate tensor writes per call.
+
+### Fix 4b — Triton RoPE Rotation Kernel (rope.py, +77 lines)
+
+A `@triton.jit apply_rope_kernel` processes one `(batch*head, seq_position)` tile per
+program. Each program:
+
+1. Loads `x1 = x[bh, s, :half_dim]` and `x2 = x[bh, s, half_dim:2*half_dim]`
+2. Loads `cos[s, :half_dim]` and `sin[s, :half_dim]`
+3. Computes `r1 = x1*cos − x2*sin` and `r2 = x2*cos + x1*sin` **in registers**
+4. Stores rotated halves and copies passthrough dimensions (for partial RoPE)
+
+Key detail: `BLOCK_D = next_power_of_two(head_dim)` (not `half_dim`) ensures the
+passthrough region (dimensions `[2*half_dim : head_dim]`, 32 elements for the audio
+encoder) is fully covered within a single program.
+
+The `torch.cat` allocation — `[1, 20, 375, 64] × float32 = 1.87 MB` per encoder Q or K
+call — is eliminated entirely.
+
+### Numerical precision
+
+RoPE kernel: **exact float32**, max absolute error vs PyTorch reference = 0.000000 for
+both audio encoder (partial RoPE, head_dim=64) and text decoder (full RoPE, head_dim=128)
+configurations. No reduced precision is involved.
+
+### Result (cumulative: Opt 1 + Opt 2 + Opt 3 + Opt 4)
+
+| | Time |
+|---|---|
+| Reference example | 1146.4 ms |
+| After Opt 1 | 1024.9 ms (−10.8%) |
+| After Opt 1 + Opt 2 | 992.0 ms (−13.5%) |
+| After Opt 1 + Opt 2 + Opt 3 | 751.4 ms (−34.5%) |
+| **After Opt 1 + Opt 2 + Opt 3 + Opt 4** | **728.0 ms (−36.5%)** |
+
+Opt 4 alone contributed **−23.4 ms (−3.1%)** on top of Opt 3. The gain is smaller than
+Opt 3 because each individual norm and RoPE operation is cheap (small tensors), but the
+cumulative effect of eliminating ~11,900 redundant kernel launches and ~792 `torch.cat`
+allocations per inference produces a measurable improvement.
+
+---
+
+## 6. Cumulative Summary
 
 ### Performance at Each Stage
 
 ```
-Reference example:          1146.4 ms  ──────────────────────── baseline
-After Opt 1 (autotune):     1024.9 ms  ████░░░░░░░░░░░░░░░░░░░  −10.8%
-After Opt 1+2 (fusion):      992.0 ms  █████░░░░░░░░░░░░░░░░░░  −13.5%
-After Opt 1+2+3 (flash):     751.4 ms  ███████████░░░░░░░░░░░░  −34.5%
+Reference example:           1146.4 ms  ──────────────────────── baseline
+After Opt 1 (autotune):      1024.9 ms  ████░░░░░░░░░░░░░░░░░░░  −10.8%
+After Opt 1+2 (fusion):       992.0 ms  █████░░░░░░░░░░░░░░░░░░  −13.5%
+After Opt 1+2+3 (flash):      751.4 ms  ███████████░░░░░░░░░░░░  −34.5%
+After Opt 1+2+3+4 (norm+RoPE): 728.0 ms  ████████████░░░░░░░░░░  −36.5%
 ```
 
 ### What Each Optimisation Targets
@@ -384,29 +469,32 @@ After Opt 1+2+3 (flash):     751.4 ms  ███████████░░�
 | Opt | Technique | Bottleneck Addressed | Primary Beneficiary |
 |-----|-----------|---------------------|---------------------|
 | 1 | `@triton.autotune` with 5 tile configs | Wrong tile size for different M regimes | Decoder M=1 decode steps; encoder wide-N FFN |
-| 2 | Kernel fusion (attention + bias) | Redundant global memory roundtrips for intermediate tensors; kernel launch overhead | Text decoder attention; audio encoder bias ops |
-| 3 | FlashAttention tiling + online softmax | Audio encoder attention PyTorch fallback; no tensor cores in attention | Audio encoder (32 layers × 20 heads) |
+| 2 | Kernel fusion (attention + bias) | Redundant global memory roundtrips; kernel launch overhead | Text decoder attention; audio encoder bias ops |
+| 3 | FlashAttention tiling + online softmax | Audio encoder attention PyTorch fallback; no tensor cores | Audio encoder (32 layers × 20 heads) |
+| 4 | Norm fallback fix + Triton RoPE kernel | 13,400 micro-kernel launches from norm/RoPE Python paths | Decoder decode steps; encoder norms + RoPE |
 
 ### Files Changed
 
-| File | Opt 1 | Opt 2 | Opt 3 |
-|------|:-----:|:-----:|:-----:|
-| `layers.py` | ✓ `@triton.autotune` on 3 kernels; padding removed | ✓ `bias_ptr` + `HAS_BIAS` added to `linear_kernel_tf32` | — |
-| `attention.py` | — | ✓ `fused_attention_kernel` added; `scaled_dot_product_attention` updated | ✓ `flash_attention_kernel` added; third routing path added |
+| File | Opt 1 | Opt 2 | Opt 3 | Opt 4 |
+|------|:-----:|:-----:|:-----:|:-----:|
+| `layers.py` | ✓ autotune + padding removed | ✓ bias fusion | — | ✓ norm guard removed |
+| `attention.py` | — | ✓ fused attention | ✓ flash attention | — |
+| `rope.py` | — | — | — | ✓ `apply_rope_kernel` added |
 
-### Why These Are Additive (Not Redundant)
+### Why All Four Are Additive (Not Redundant)
 
-The three optimisations target **orthogonal bottlenecks**:
+All four optimisations target **orthogonal bottlenecks**:
 
-1. **Opt 1** improves matmul tile efficiency — it only affects `tl.dot` tile config selection. The attention kernels and bias ops are unaffected.
-2. **Opt 2** reduces kernel launch count and global memory traffic for already-small sequences (text decoder seq_k ≤ 256). It does not change tile selection and cannot help sequences > 256.
-3. **Opt 3** targets the remaining PyTorch fallback for long sequences (audio encoder seq_k ≈ 375) and adds tensor core access to the attention path. It does not affect matmul tile selection or the text decoder attention (which still uses `fused_attention_kernel` for seq_k ≤ 256).
+1. **Opt 1** improves matmul tile efficiency. Unaffected by kernel fusion or attention changes.
+2. **Opt 2** fuses attention and bias ops for short sequences. Unaffected by tile selection or RoPE.
+3. **Opt 3** moves long-sequence encoder attention from Python to Triton. Orthogonal to norms and RoPE.
+4. **Opt 4** eliminates the norm and RoPE Python dispatch overhead that survived Opt 1–3. Orthogonal to matmul tiling, attention fusion, and FlashAttention.
 
 Each optimisation is active and contributes independently in the final combined implementation.
 
 ---
 
-## 6. Benchmark Methodology
+## 7. Benchmark Methodology
 
 **Tool:** `benchmark_student.py` via `benchmark.sh`
 **Runs:** 1 warmup run (JIT compile + populate autotune cache) + 3 timed runs
@@ -417,7 +505,7 @@ The warmup run is essential for Opt 1: Triton's autotune cache is in-memory only
 
 ---
 
-## 7. Hardware Context
+## 8. Hardware Context
 
 **NVIDIA L4 (Ada Lovelace, sm_89)**
 
@@ -438,12 +526,14 @@ The warmup run is essential for Opt 1: Triton's autotune cache is in-memory only
 - **Opt 1:** The 5 autotune configs were designed around the L4's 60 SMs, 100 KB shared memory, and the fact that `num_stages=4` is beneficial for hiding DRAM latency (~300 cycles on GDDR6). The winning configs differ from what would be optimal on A100 or H100 hardware — the autotuner adapts to whatever GPU it runs on.
 - **Opt 2:** 560 GB/s peak bandwidth makes even small intermediate tensors worth eliminating. At that rate, a 563 KB scores tensor (1 encoder attention head) takes ~1 µs to write — and another 1 µs to read back — per call.
 - **Opt 3:** 4th-generation tensor cores (TF32 mode) are only engaged when matrix dimensions ≥ 16. The `FLASH_BLOCK_Q=16` choice was made precisely to meet this minimum. At TF32 throughput, `tl.dot([16,64] @ [64,64])` achieves ~10× the throughput of the element-wise sum loop it replaces.
+- **Opt 4:** No TF32 involvement. Normalization and RoPE use pure float32 arithmetic. The `BLOCK_D = next_power_of_two(head_dim)` sizing allows the compiler to allocate exact register arrays without dynamic indexing overhead.
 
 ---
 
-## 8. Precision Notes
+## 9. Precision Notes
 
 - All matmul kernels accumulate in **float32**.
 - `tl.dot` uses **TF32** (10-bit mantissa) for the multiply stage on Ampere+/Ada. This is slightly less precise than full float32 but gives full tensor-core throughput. The accuracy difference is negligible for inference (confirmed: 100% transcription accuracy throughout).
 - The flash attention kernel's max absolute error vs. a full float32 PyTorch reference is < 0.002 (< 0.5% relative error on a unit-variance input), well within model tolerance.
+- The Opt 4 RoPE kernel is **exact float32** — max absolute error vs PyTorch reference is 0.000000 for both encoder (partial RoPE, head_dim=64) and decoder (full RoPE, head_dim=128) configurations.
 - Output dtype is preserved: results are cast back to the input tensor's dtype (typically `float16` or `bfloat16`) after computation.
