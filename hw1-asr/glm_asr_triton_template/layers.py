@@ -37,6 +37,34 @@ def next_power_of_two(x: int) -> int:
 
 
 # ============================================================================
+# Autotune Configurations for Matmul Kernels
+# ============================================================================
+# Five configurations covering the key trade-offs on NVIDIA L4 (sm_89,
+# Ada Lovelace, 60 SMs, 24 GB GDDR6, 48 MB L2):
+#  - Tile size determines register pressure and occupancy
+#  - num_warps controls threads per block (num_warps * 32 threads)
+#  - num_stages controls software-pipeline depth (prefetch depth in K-loop)
+#
+# The model has two very different M regimes:
+#   Encode: M ~ 375 (audio frames), K/N in {1280, 5120}
+#   Decode: M = 1 (single token), K/N in {3584, 18944}
+# A single fixed tile cannot be optimal for both — autotune picks per shape.
+
+autotune_configs = [
+    # Config 1: Baseline — matches the original hardcoded values
+    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64,  "BLOCK_K": 32}, num_warps=4, num_stages=2),
+    # Config 2: Large square tiles — best compute intensity for big encode matmuls
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=3),
+    # Config 3: Wide N + deep K pipeline — favoured for decode (M=1) and FFN projections
+    triton.Config({"BLOCK_M": 32,  "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=4, num_stages=4),
+    # Config 4: Tall M, balanced K — sustained throughput for encoder hidden projections
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 64}, num_warps=8, num_stages=4),
+    # Config 5: Very wide N — targets encoder FFN (K=1280 → N=5120) and decoder FFN
+    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 256, "BLOCK_K": 32}, num_warps=8, num_stages=3),
+]
+
+
+# ============================================================================
 # Triton Kernels
 # ============================================================================
 
@@ -182,6 +210,7 @@ def silu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     
 
 
+@triton.autotune(configs=autotune_configs, key=["M", "N", "K"])
 @triton.jit
 def linear_kernel_tf32(
     a_ptr,
@@ -242,6 +271,7 @@ def linear_kernel_tf32(
     tl.store(c_ptrs, acc, mask=mask_c)
 
 
+@triton.autotune(configs=autotune_configs, key=["M", "N", "K"])
 @triton.jit
 def linear_gelu_kernel(
     a_ptr,
@@ -294,6 +324,7 @@ def linear_gelu_kernel(
     )
 
 
+@triton.autotune(configs=autotune_configs, key=["M", "N", "K"])
 @triton.jit
 def swiglu_fused_kernel(
     a_ptr,
@@ -694,10 +725,6 @@ def get_activation(name: str):
 class Linear:
     """Linear layer with switchable backend (torch or Triton)."""
 
-    TILE_M = 64
-    TILE_N = 64
-    TILE_K = 32
-
     BACKEND = "torch"
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True):
@@ -708,29 +735,12 @@ class Linear:
         self.weight = torch.zeros((out_features, in_features), dtype=torch.float32)
         self.bias_param = torch.zeros(out_features, dtype=torch.float32) if bias else None
 
-        self._weight_t_padded = None
-        self._K_padded = None
-        self._N_padded = None
+        self._weight_t_padded = None  # cached transposed weight (no padding needed)
 
     def _ensure_weight_prepared(self):
-        """Cache transposed and padded weight for Triton kernel."""
+        """Cache transposed weight for Triton kernel."""
         if self._weight_t_padded is None:
-            K = self.in_features
-            N = self.out_features
-            self._K_padded = pad_to_multiple(K, self.TILE_K)
-            self._N_padded = pad_to_multiple(N, self.TILE_N)
-
-            weight_t = self.weight.t().contiguous()
-            if self._K_padded > K or self._N_padded > N:
-                weight_pad = torch.zeros(
-                    (self._K_padded, self._N_padded),
-                    dtype=torch.float32,
-                    device=weight_t.device,
-                )
-                weight_pad[:K, :N] = weight_t
-                self._weight_t_padded = weight_pad
-            else:
-                self._weight_t_padded = weight_t
+            self._weight_t_padded = self.weight.t().contiguous()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         if Linear.BACKEND in ("torch", "cublas"):
@@ -738,7 +748,7 @@ class Linear:
         if Linear.BACKEND == "triton":
             return self._forward_triton(x)
         M = int(np.prod(x.shape[:-1]))
-        if M >= self.TILE_M and x.is_cuda:
+        if M >= 1 and x.is_cuda:
             return self._forward_triton(x)
         return self._forward_torch(x)
 
@@ -762,7 +772,7 @@ class Linear:
         return output.reshape(*batch_dims, self.out_features)
 
     def _forward_triton(self, x: torch.Tensor) -> torch.Tensor:
-        """Triton matmul backend."""
+        """Triton matmul backend. Autotuner selects the best tile config per (M,N,K)."""
         original_shape = x.shape
         batch_dims = original_shape[:-1]
 
@@ -777,45 +787,26 @@ class Linear:
             self._weight_t_padded = None
         self._ensure_weight_prepared()
 
-        M_padded = pad_to_multiple(M, self.TILE_M)
+        output = torch.zeros((M, N), dtype=torch.float32, device=x.device)
 
-        if M_padded > M or self._K_padded > K:
-            x_padded = torch.zeros(
-                (M_padded, self._K_padded),
-                dtype=torch.float32,
-                device=x.device,
-            )
-            x_padded[:M, :K] = x_2d
-        else:
-            x_padded = x_2d
-
-        output = torch.zeros(
-            (M_padded, self._N_padded), dtype=torch.float32, device=x.device
-        )
-
-        grid = (
-            triton.cdiv(M_padded, self.TILE_M),
-            triton.cdiv(self._N_padded, self.TILE_N),
+        # Grid is a lambda: evaluated after autotuner selects the winning config
+        grid = lambda meta: (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
         )
         linear_kernel_tf32[grid](
-            x_padded,
+            x_2d,
             self._weight_t_padded,
             output,
-            M_padded,
-            self._N_padded,
-            self._K_padded,
-            x_padded.stride(0),
-            x_padded.stride(1),
+            M, N, K,
+            x_2d.stride(0),
+            x_2d.stride(1),
             self._weight_t_padded.stride(0),
             self._weight_t_padded.stride(1),
             output.stride(0),
             output.stride(1),
-            BLOCK_M=self.TILE_M,
-            BLOCK_N=self.TILE_N,
-            BLOCK_K=self.TILE_K,
+            # BLOCK_M, BLOCK_N, BLOCK_K are injected by @triton.autotune — do not pass manually
         )
-
-        output = output[:M, :N]
 
         if self.has_bias and self.bias_param is not None:
             if self.bias_param.device != x.device:
@@ -902,7 +893,6 @@ class MLP:
     """MLP with SwiGLU gating using Triton."""
 
     FUSED = True
-    TILE_M, TILE_N, TILE_K = 64, 64, 32
 
     def __init__(
         self,
@@ -949,7 +939,7 @@ class MLP:
         return self.down_proj(self.act_fn(self.up_proj(x)))
 
     def _forward_fused(self, x: torch.Tensor) -> torch.Tensor:
-        """Fused SwiGLU forward pass."""
+        """Fused SwiGLU forward pass. Autotuner selects best tile config per (M,N,K)."""
         if self.gate_proj.weight.device != x.device:
             self.gate_proj.weight = self.gate_proj.weight.to(x.device)
             self._gate_weight_t = None
@@ -964,62 +954,28 @@ class MLP:
         K = self.hidden_size
         N = self.intermediate_size
 
-        M_pad = pad_to_multiple(M, self.TILE_M)
-        K_pad = pad_to_multiple(K, self.TILE_K)
-        N_pad = pad_to_multiple(N, self.TILE_N)
+        intermediate = torch.zeros((M, N), dtype=torch.float32, device=x.device)
 
-        if M != M_pad or K != K_pad:
-            x_padded = torch.zeros(
-                (M_pad, K_pad), dtype=torch.float32, device=x.device
-            )
-            x_padded[:M, :K] = x_2d
-        else:
-            x_padded = x_2d
-
-        if K != K_pad or N != N_pad:
-            gate_w_padded = torch.zeros(
-                (K_pad, N_pad), dtype=torch.float32, device=x.device
-            )
-            gate_w_padded[:K, :N] = self._gate_weight_t
-            up_w_padded = torch.zeros(
-                (K_pad, N_pad), dtype=torch.float32, device=x.device
-            )
-            up_w_padded[:K, :N] = self._up_weight_t
-        else:
-            gate_w_padded = self._gate_weight_t
-            up_w_padded = self._up_weight_t
-
-        intermediate = torch.zeros(
-            (M_pad, N_pad), dtype=torch.float32, device=x.device
-        )
-
-        grid = (
-            triton.cdiv(M_pad, self.TILE_M),
-            triton.cdiv(N_pad, self.TILE_N),
+        grid = lambda meta: (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
         )
         swiglu_fused_kernel[grid](
-            x_padded,
-            gate_w_padded,
-            up_w_padded,
+            x_2d,
+            self._gate_weight_t,
+            self._up_weight_t,
             intermediate,
-            M_pad,
-            N_pad,
-            K_pad,
-            x_padded.stride(0),
-            x_padded.stride(1),
-            gate_w_padded.stride(0),
-            gate_w_padded.stride(1),
-            up_w_padded.stride(0),
-            up_w_padded.stride(1),
+            M, N, K,
+            x_2d.stride(0),
+            x_2d.stride(1),
+            self._gate_weight_t.stride(0),
+            self._gate_weight_t.stride(1),
+            self._up_weight_t.stride(0),
+            self._up_weight_t.stride(1),
             intermediate.stride(0),
             intermediate.stride(1),
-            BLOCK_M=self.TILE_M,
-            BLOCK_N=self.TILE_N,
-            BLOCK_K=self.TILE_K,
+            # BLOCK_M, BLOCK_N, BLOCK_K injected by @triton.autotune
         )
-
-        if M != M_pad or N != N_pad:
-            intermediate = intermediate[:M, :N]
 
         intermediate = intermediate.reshape(*orig_shape[:-1], self.intermediate_size)
         return self.down_proj(intermediate)
@@ -1029,7 +985,6 @@ class EncoderMLP:
     """Encoder MLP (no gating) using Triton."""
 
     FUSED = True
-    TILE_M, TILE_N, TILE_K = 64, 64, 32
 
     def __init__(
         self,
@@ -1063,7 +1018,7 @@ class EncoderMLP:
         return self.fc2(self.act_fn(self.fc1(x)))
 
     def _forward_fused(self, x: torch.Tensor) -> torch.Tensor:
-        """Fused Linear+GELU forward pass."""
+        """Fused Linear+GELU forward pass. Autotuner selects best tile config per (M,N,K)."""
         if self.fc1.weight.device != x.device:
             self.fc1.weight = self.fc1.weight.to(x.device)
             self._fc1_weight_t = None
@@ -1075,54 +1030,25 @@ class EncoderMLP:
         K = self.hidden_size
         N = self.intermediate_size
 
-        M_pad = pad_to_multiple(M, self.TILE_M)
-        K_pad = pad_to_multiple(K, self.TILE_K)
-        N_pad = pad_to_multiple(N, self.TILE_N)
+        intermediate = torch.zeros((M, N), dtype=torch.float32, device=x.device)
 
-        if M != M_pad or K != K_pad:
-            x_padded = torch.zeros(
-                (M_pad, K_pad), dtype=torch.float32, device=x.device
-            )
-            x_padded[:M, :K] = x_2d
-        else:
-            x_padded = x_2d
-
-        if K != K_pad or N != N_pad:
-            fc1_w_padded = torch.zeros(
-                (K_pad, N_pad), dtype=torch.float32, device=x.device
-            )
-            fc1_w_padded[:K, :N] = self._fc1_weight_t
-        else:
-            fc1_w_padded = self._fc1_weight_t
-
-        intermediate = torch.zeros(
-            (M_pad, N_pad), dtype=torch.float32, device=x.device
-        )
-
-        grid = (
-            triton.cdiv(M_pad, self.TILE_M),
-            triton.cdiv(N_pad, self.TILE_N),
+        grid = lambda meta: (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
         )
         linear_gelu_kernel[grid](
-            x_padded,
-            fc1_w_padded,
+            x_2d,
+            self._fc1_weight_t,
             intermediate,
-            M_pad,
-            N_pad,
-            K_pad,
-            x_padded.stride(0),
-            x_padded.stride(1),
-            fc1_w_padded.stride(0),
-            fc1_w_padded.stride(1),
+            M, N, K,
+            x_2d.stride(0),
+            x_2d.stride(1),
+            self._fc1_weight_t.stride(0),
+            self._fc1_weight_t.stride(1),
             intermediate.stride(0),
             intermediate.stride(1),
-            BLOCK_M=self.TILE_M,
-            BLOCK_N=self.TILE_N,
-            BLOCK_K=self.TILE_K,
+            # BLOCK_M, BLOCK_N, BLOCK_K injected by @triton.autotune
         )
-
-        if M != M_pad or N != N_pad:
-            intermediate = intermediate[:M, :N]
 
         if self.bias_enabled and self.fc1.bias_param is not None:
             if self.fc1.bias_param.device != x.device:
