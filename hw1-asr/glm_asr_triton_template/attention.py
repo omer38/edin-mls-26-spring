@@ -204,6 +204,158 @@ def causal_mask_kernel(
     )
 
 
+# Block sizes for flash_attention_kernel.
+# FLASH_BLOCK_Q: query rows processed per program (must be ≥ 16 for tl.dot tensor cores).
+# FLASH_BLOCK_K: key/value rows loaded per inner-loop iteration.
+FLASH_BLOCK_Q = 16
+FLASH_BLOCK_K = 64
+
+
+@triton.jit
+def flash_attention_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    output_ptr,
+    scale,
+    seq_q,
+    seq_k,
+    head_dim,
+    is_causal: tl.constexpr,
+    stride_q0,
+    stride_q1,
+    stride_q2,
+    stride_k0,
+    stride_k1,
+    stride_k2,
+    stride_v0,
+    stride_v1,
+    stride_v2,
+    stride_o0,
+    stride_o1,
+    stride_o2,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """
+    FlashAttention-style tiled attention kernel.
+
+    Processes K and V in tiles of BLOCK_K rows so they are never fully
+    materialised in global memory.  Online softmax (Dao et al., 2022) keeps
+    numerically stable running statistics across tiles:
+
+        m_i  — running row-max of scaled scores seen so far
+        l_i  — running row-sum of exp(scores - m_i) seen so far
+        acc  — running weighted-sum accumulator (output numerator)
+
+    Each tile update:
+        alpha = exp(m_old - m_new)           # rescale factor
+        l_i   = l_i  * alpha + rowsum(P)     # P = exp(scores - m_new)
+        acc   = acc  * alpha + P @ V_tile
+    Final output: acc / l_i  (single normalisation, single write to DRAM).
+
+    Using BLOCK_Q ≥ 16 and BLOCK_K ≥ 16 enables tl.dot (tensor core path)
+    for both the Q@K^T and P@V multiplications — unavailable in the
+    per-query fused_attention_kernel which processes one row at a time.
+
+    Grid: (batch * num_heads, cdiv(seq_q, BLOCK_Q))
+    """
+    pid_bh = tl.program_id(0)
+    pid_q  = tl.program_id(1)
+
+    q_start = pid_q * BLOCK_Q
+    q_offs  = q_start + tl.arange(0, BLOCK_Q)   # [BLOCK_Q]
+    d_offs  = tl.arange(0, BLOCK_D)             # [BLOCK_D]
+
+    # -------------------------------------------------------------------------
+    # Load Q tile — held in registers for the entire inner loop.
+    # Pre-scale here to avoid a multiply inside the loop.
+    # -------------------------------------------------------------------------
+    q_mask  = (q_offs[:, None] < seq_q) & (d_offs[None, :] < head_dim)
+    q_block = tl.load(
+        q_ptr + pid_bh * stride_q0
+              + q_offs[:, None] * stride_q1
+              + d_offs[None, :] * stride_q2,
+        mask=q_mask, other=0.0,
+    ).to(tl.float32) * scale                    # [BLOCK_Q, BLOCK_D]
+
+    # -------------------------------------------------------------------------
+    # Online-softmax running state
+    # -------------------------------------------------------------------------
+    acc = tl.zeros((BLOCK_Q, BLOCK_D), dtype=tl.float32)
+    m_i = tl.full((BLOCK_Q,), -1e9, dtype=tl.float32)   # running row-max
+    l_i = tl.zeros((BLOCK_Q,),       dtype=tl.float32)   # running row-sum
+
+    # -------------------------------------------------------------------------
+    # Inner loop: iterate over K/V tiles.
+    # Using the actual (non-padded) seq_k as the upper bound avoids
+    # unnecessary iterations on the audio encoder (seq_k ≈ 375).
+    # -------------------------------------------------------------------------
+    for k_start in range(0, seq_k, BLOCK_K):
+        k_offs  = k_start + tl.arange(0, BLOCK_K)   # [BLOCK_K]
+        kv_mask = (k_offs[:, None] < seq_k) & (d_offs[None, :] < head_dim)
+
+        # Load K tile [BLOCK_K, BLOCK_D] — coalesced access (d is innermost).
+        k_block = tl.load(
+            k_ptr + pid_bh * stride_k0
+                  + k_offs[:, None] * stride_k1
+                  + d_offs[None, :] * stride_k2,
+            mask=kv_mask, other=0.0,
+        ).to(tl.float32)                             # [BLOCK_K, BLOCK_D]
+
+        # scores = Q_tile @ K_tile^T : [BLOCK_Q, BLOCK_K]
+        # tl.trans transposes in-register; tl.dot uses tensor cores (BLOCK_Q,
+        # BLOCK_K, BLOCK_D all ≥ 16).
+        scores = tl.dot(q_block, tl.trans(k_block))  # [BLOCK_Q, BLOCK_K]
+
+        # Mask padding positions (keys beyond actual seq_k).
+        scores = tl.where(k_offs[None, :] < seq_k, scores, -1e9)
+
+        # Apply causal mask inline — no intermediate global-memory write.
+        # threshold[i] = seq_k - seq_q + q_offs[i]
+        #   prefill (seq_q==seq_k==N): threshold = q_offs[i]  → mask j > i  ✓
+        #   decode  (seq_q==1, seq_k==N): threshold = N-1      → nothing masked ✓
+        if is_causal:
+            causal_thresh = (seq_k - seq_q + q_offs)[:, None]   # [BLOCK_Q, 1]
+            scores = tl.where(k_offs[None, :] > causal_thresh, -1e9, scores)
+
+        # --- Online softmax update -------------------------------------------
+        m_ij  = tl.max(scores, axis=1)              # [BLOCK_Q]: tile max
+        m_new = tl.maximum(m_i, m_ij)               # [BLOCK_Q]: updated max
+
+        # Softmax numerators for this tile.
+        p     = tl.exp(scores - m_new[:, None])      # [BLOCK_Q, BLOCK_K]
+
+        # Rescale running state by exp(m_old - m_new) before adding new tile.
+        alpha = tl.exp(m_i - m_new)                  # [BLOCK_Q]
+        l_i   = l_i * alpha + tl.sum(p, axis=1)      # [BLOCK_Q]
+        acc   = acc * alpha[:, None]                  # [BLOCK_Q, BLOCK_D]
+
+        # Load V tile [BLOCK_K, BLOCK_D] and accumulate.
+        v_block = tl.load(
+            v_ptr + pid_bh * stride_v0
+                  + k_offs[:, None] * stride_v1
+                  + d_offs[None, :] * stride_v2,
+            mask=kv_mask, other=0.0,
+        ).to(tl.float32)                             # [BLOCK_K, BLOCK_D]
+
+        acc   += tl.dot(p, v_block)                  # [BLOCK_Q, BLOCK_D]
+        m_i    = m_new
+
+    # -------------------------------------------------------------------------
+    # Normalise and write output — first and only global-memory write.
+    # -------------------------------------------------------------------------
+    out      = acc / l_i[:, None]
+    out_mask = (q_offs[:, None] < seq_q) & (d_offs[None, :] < head_dim)
+    tl.store(
+        output_ptr + pid_bh * stride_o0
+                   + q_offs[:, None] * stride_o1
+                   + d_offs[None, :] * stride_o2,
+        out, mask=out_mask,
+    )
+
+
 @triton.jit
 def fused_attention_kernel(
     q_ptr,
@@ -388,16 +540,18 @@ def scaled_dot_product_attention(
     scale: Optional[float] = None,
 ) -> torch.Tensor:
     """
-    Scaled dot-product attention.
+    Scaled dot-product attention with three-tier dispatch:
 
-    Triton fast path (when seq_k and head_dim fit in MAX_ATTENTION_DIM and no
-    external attention_mask is provided): uses fused_attention_kernel which
-    computes Q·K^T, applies the causal mask, runs softmax, and multiplies by V
-    all in a single kernel — no intermediate scores tensor is ever written to
-    global memory.
+    1. fused_attention_kernel (Opt 2) — seq_k ≤ MAX_ATTENTION_DIM, no mask.
+       Holds entire K/V in registers; zero loop overhead; fastest for small seq.
 
-    Falls back to PyTorch einsum when the sequence is too long for the current
-    block-register budget or when an external attention_mask is supplied.
+    2. flash_attention_kernel (Opt 3) — seq_k > MAX_ATTENTION_DIM, no mask.
+       Tiles K/V in FLASH_BLOCK_K=64 chunks; online softmax.  Removes the
+       PyTorch fallback for the audio encoder (seq_k ≈ 375, padded 512 > 256).
+       Uses tl.dot (tensor cores) for both Q@K^T and P@V multiply-accumulates.
+
+    3. PyTorch fallback — external attention_mask present, or CPU.
+       Only this path remains on the Python side after Opt 3.
     """
     batch, num_heads, seq_q, head_dim = q.shape
     _, _, seq_k, _ = k.shape
@@ -405,35 +559,28 @@ def scaled_dot_product_attention(
     if scale is None:
         scale = 1.0 / np.sqrt(head_dim)
 
-    seq_k_padded = next_power_of_two(seq_k)
+    seq_k_padded   = next_power_of_two(seq_k)
     head_dim_padded = next_power_of_two(head_dim)
 
-    # Use the fused Triton kernel when:
-    #   • tensors are on CUDA
-    #   • no external attention_mask (handled inline for causal; external masks
-    #     require a separate add which is not worth adding extra kernel args for)
-    #   • block sizes fit in the per-SM register budget
-    use_triton = (
+    # --- Path 1: fused kernel (small seq, no mask) ---------------------------
+    use_fused = (
         q.is_cuda
         and attention_mask is None
-        and seq_k_padded <= MAX_ATTENTION_DIM
+        and seq_k_padded  <= MAX_ATTENTION_DIM
         and head_dim_padded <= MAX_ATTENTION_DIM
     )
-
-    if use_triton:
+    if use_fused:
         # Reshape to (batch*heads, seq, dim) — no explicit zero-padding needed;
         # the fused kernel uses boundary masks (other=0.0) instead.
         q_flat = q.reshape(batch * num_heads, seq_q, head_dim).to(torch.float32).contiguous()
         k_flat = k.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32).contiguous()
         v_flat = v.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32).contiguous()
 
-        # Output buffer — head_dim_padded == head_dim for all standard dims (64, 128).
         output = torch.empty(
             (batch * num_heads, seq_q, head_dim_padded),
             dtype=torch.float32,
             device=q.device,
         )
-
         grid = (batch * num_heads, seq_q)
         fused_attention_kernel[grid](
             q_flat, k_flat, v_flat, output,
@@ -446,16 +593,47 @@ def scaled_dot_product_attention(
             BLOCK_K=seq_k_padded,
             BLOCK_D=head_dim_padded,
         )
-
         if head_dim_padded != head_dim:
             output = output[:, :, :head_dim]
-
         return output.reshape(batch, num_heads, seq_q, head_dim).to(q.dtype)
 
-    # ------------------------------------------------------------------
-    # PyTorch fallback: used when seq_k > MAX_ATTENTION_DIM or when an
-    # external attention_mask is provided.
-    # ------------------------------------------------------------------
+    # --- Path 2: flash kernel (large seq, no mask) ---------------------------
+    # Handles the audio encoder (seq_k ≈ 375 → padded 512 > MAX_ATTENTION_DIM).
+    # head_dim is always 64 or 128 for this model, both ≤ MAX_ATTENTION_DIM.
+    use_flash = (
+        q.is_cuda
+        and attention_mask is None
+        and head_dim_padded <= MAX_ATTENTION_DIM
+    )
+    if use_flash:
+        q_flat = q.reshape(batch * num_heads, seq_q, head_dim).to(torch.float32).contiguous()
+        k_flat = k.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32).contiguous()
+        v_flat = v.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32).contiguous()
+
+        # Output buffer (head_dim_padded == head_dim for standard dims 64/128).
+        output = torch.empty(
+            (batch * num_heads, seq_q, head_dim_padded),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        grid = (batch * num_heads, triton.cdiv(seq_q, FLASH_BLOCK_Q))
+        flash_attention_kernel[grid](
+            q_flat, k_flat, v_flat, output,
+            float(scale), seq_q, seq_k, head_dim,
+            is_causal,
+            q_flat.stride(0), q_flat.stride(1), q_flat.stride(2),
+            k_flat.stride(0), k_flat.stride(1), k_flat.stride(2),
+            v_flat.stride(0), v_flat.stride(1), v_flat.stride(2),
+            output.stride(0), output.stride(1), output.stride(2),
+            BLOCK_Q=FLASH_BLOCK_Q,
+            BLOCK_K=FLASH_BLOCK_K,
+            BLOCK_D=head_dim_padded,
+        )
+        if head_dim_padded != head_dim:
+            output = output[:, :, :head_dim]
+        return output.reshape(batch, num_heads, seq_q, head_dim).to(q.dtype)
+
+    # --- Path 3: PyTorch fallback (external mask or CPU) ---------------------
     scores = torch.einsum("bnqd,bnkd->bnqk", q, k) * scale
 
     if is_causal:
@@ -516,6 +694,37 @@ if __name__ == "__main__":
     )
     output_gqa = attn(q, k_gqa, v_gqa)
     print(f"  Output shape: {output_gqa.shape}")
+
+    # ------------------------------------------------------------------
+    # FlashAttention path (Opt 3): seq_k > MAX_ATTENTION_DIM
+    # Simulate audio encoder: seq_len=375, head_dim=64 (padded 512 > 256)
+    # ------------------------------------------------------------------
+    print("\nFlashAttention path (seq_k=375, head_dim=64):")
+    seq_flash = 375
+    q_flash = torch.randn(1, 4, seq_flash, 64, device=device)
+    k_flash = torch.randn(1, 4, seq_flash, 64, device=device)
+    v_flash = torch.randn(1, 4, seq_flash, 64, device=device)
+    # Reference via PyTorch (forced by dummy mask then removed for comparison)
+    scale_f = 1.0 / (64 ** 0.5)
+    scores_ref = torch.einsum("bnqd,bnkd->bnqk", q_flash.float(), k_flash.float()) * scale_f
+    scores_ref = scores_ref - torch.max(scores_ref, dim=-1, keepdim=True).values
+    w_ref = torch.exp(scores_ref) / torch.sum(torch.exp(scores_ref), dim=-1, keepdim=True)
+    out_ref = torch.einsum("bnqk,bnkd->bnqd", w_ref, v_flash.float())
+    # Flash kernel output
+    out_flash = scaled_dot_product_attention(q_flash, k_flash, v_flash)
+    max_err = float((out_flash.float() - out_ref).abs().max())
+    print(f"  Output shape: {out_flash.shape}")
+    print(f"  Max abs error vs PyTorch: {max_err:.6f}  ({'PASS' if max_err < 5e-3 else 'FAIL'})")
+
+    print("\nFlashAttention causal path (seq_k=375):")
+    out_flash_c = scaled_dot_product_attention(q_flash, k_flash, v_flash, is_causal=True)
+    causal_mask = torch.triu(torch.ones(seq_flash, seq_flash, device=device), diagonal=1) * -1e9
+    scores_c = torch.einsum("bnqd,bnkd->bnqk", q_flash.float(), k_flash.float()) * scale_f + causal_mask[None, None]
+    scores_c = scores_c - torch.max(scores_c, dim=-1, keepdim=True).values
+    w_c = torch.exp(scores_c) / torch.sum(torch.exp(scores_c), dim=-1, keepdim=True)
+    out_ref_c = torch.einsum("bnqk,bnkd->bnqd", w_c, v_flash.float())
+    max_err_c = float((out_flash_c.float() - out_ref_c).abs().max())
+    print(f"  Max abs error vs PyTorch: {max_err_c:.6f}  ({'PASS' if max_err_c < 5e-3 else 'FAIL'})")
 
     print("\nOutput statistics:")
     print(f"  Mean: {float(output.mean()):.4f}")
