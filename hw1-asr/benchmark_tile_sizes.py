@@ -132,7 +132,7 @@ def linear_gelu_kernel_bench(
     sqrt_2_over_pi = 0.7978845608028654
     acc3 = acc * acc * acc
     inner = sqrt_2_over_pi * (acc + 0.044715 * acc3)
-    acc = acc * 0.5 * (1.0 + tl.libdevice.tanh(inner))
+    acc = acc * 0.5 * (1.0 + tl.extra.cuda.libdevice.tanh(inner))
 
     tl.store(
         c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
