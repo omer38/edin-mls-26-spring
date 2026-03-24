@@ -1,0 +1,466 @@
+(edin-mls-26-spring) root@bc5e6a118e37:~/edin-mls-26-spring/hw1-asr# ./benchmark_detailed.sh glm_asr_triton_template
+
+First RUN:
+
+======================================================================
+GLM-ASR Detailed Operator Profiling
+======================================================================
+
+Loading test audio...
+Audio: 3.50s @ 16000Hz
+
+Loading model from glm_asr_triton_template...
+Loading HuggingFace model: zai-org/GLM-ASR-Nano-2512
+Creating Triton model with config:
+  Audio: hidden=1280, heads=20, layers=32
+  Text: hidden=2048, heads=16, kv_heads=4, layers=28
+Loading HuggingFace weights...
+Loading weights: 100%|█| 745/745 [00:04<00:00, 174.91it/s, Materializing param=mul
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading audio encoder weights...
+Loading multi-modal projector weights...
+Loading text decoder weights...
+Weight loading complete!
+Input features shape: torch.Size([1, 128, 3000])
+Input IDs shape: torch.Size([1, 59])
+
+======================================================================
+DETAILED OPERATOR PROFILING (TORCH)
+======================================================================
+
+[1/4] Profiling Audio Encoder...
+  Audio Encoder: 869.84ms (+/- 480.72ms)
+
+[2/4] Profiling Multi-modal Projector...
+  Projector: 14.78ms (+/- 18.00ms)
+
+[3/4] Profiling Text Decoder (Prefill)...
+  Decoder Prefill: 630.05ms (+/- 838.26ms)
+
+[4/4] Profiling Decode Steps...
+  Decode Step (avg): 35.76ms (+/- 4.94ms)
+
+[5] Profiling Individual Decoder Layers...
+  Layer 0: 1.87ms (+/- 0.03ms)
+  Layer 1: 1.85ms (+/- 0.01ms)
+  Layer 2: 1.86ms (+/- 0.00ms)
+  Layer 3: 1.91ms (+/- 0.05ms)
+  Layer 4: 1.86ms (+/- 0.02ms)
+
+======================================================================
+PERFORMANCE SUMMARY
+======================================================================
+
+Component                              Time (ms)   % of Total
+------------------------------------------------------------
+Audio Encoder                           869.84ms       26.3%
+Multi-modal Projector                    14.78ms        0.4%
+Decoder (Prefill)                       630.05ms       19.1%
+Decoder (50 decode steps)              1787.89ms       54.1%
+------------------------------------------------------------
+TOTAL (estimated for 50 tokens)        3302.56ms
+
+
+Second RUN:
+
+(edin-mls-26-spring) root@bc5e6a118e37:~/edin-mls-26-spring/hw1-asr# ./benchmark_detailed.sh glm_asr_triton_template
+======================================================================
+GLM-ASR Detailed Operator Profiling
+======================================================================
+
+Loading test audio...
+Audio: 3.50s @ 16000Hz
+
+Loading model from glm_asr_triton_template...
+Loading HuggingFace model: zai-org/GLM-ASR-Nano-2512
+Creating Triton model with config:
+  Audio: hidden=1280, heads=20, layers=32
+  Text: hidden=2048, heads=16, kv_heads=4, layers=28
+Loading HuggingFace weights...
+Loading weights: 100%|█| 745/745 [00:04<00:00, 163.93it/s, Materializing param=mul
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading audio encoder weights...
+Loading multi-modal projector weights...
+Loading text decoder weights...
+Weight loading complete!
+Input features shape: torch.Size([1, 128, 3000])
+Input IDs shape: torch.Size([1, 59])
+
+======================================================================
+DETAILED OPERATOR PROFILING (TORCH)
+======================================================================
+
+[1/4] Profiling Audio Encoder...
+  Audio Encoder: 887.71ms (+/- 508.18ms)
+
+[2/4] Profiling Multi-modal Projector...
+  Projector: 14.12ms (+/- 17.02ms)
+
+[3/4] Profiling Text Decoder (Prefill)...
+  Decoder Prefill: 635.98ms (+/- 846.95ms)
+
+[4/4] Profiling Decode Steps...
+  Decode Step (avg): 35.65ms (+/- 4.12ms)
+
+[5] Profiling Individual Decoder Layers...
+  Layer 0: 1.88ms (+/- 0.02ms)
+  Layer 1: 1.86ms (+/- 0.02ms)
+  Layer 2: 1.85ms (+/- 0.00ms)
+  Layer 3: 1.85ms (+/- 0.00ms)
+  Layer 4: 1.85ms (+/- 0.01ms)
+
+======================================================================
+PERFORMANCE SUMMARY
+======================================================================
+
+Component                              Time (ms)   % of Total
+------------------------------------------------------------
+Audio Encoder                           887.71ms       26.7%
+Multi-modal Projector                    14.12ms        0.4%
+Decoder (Prefill)                       635.98ms       19.2%
+Decoder (50 decode steps)              1782.45ms       53.7%
+------------------------------------------------------------
+TOTAL (estimated for 50 tokens)        3320.26ms
+
+
+Third RUN:
+(edin-mls-26-spring) root@bc5e6a118e37:~/edin-mls-26-spring/hw1-asr# ./benchmark_detailed.sh glm_asr_triton_template
+======================================================================
+GLM-ASR Detailed Operator Profiling
+======================================================================
+
+Loading test audio...
+Audio: 3.50s @ 16000Hz
+
+Loading model from glm_asr_triton_template...
+Loading HuggingFace model: zai-org/GLM-ASR-Nano-2512
+Creating Triton model with config:
+  Audio: hidden=1280, heads=20, layers=32
+  Text: hidden=2048, heads=16, kv_heads=4, layers=28
+Loading HuggingFace weights...
+Loading weights: 100%|█| 745/745 [00:04<00:00, 172.49it/s, Materializing param=mul
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading audio encoder weights...
+Loading multi-modal projector weights...
+Loading text decoder weights...
+Weight loading complete!
+Input features shape: torch.Size([1, 128, 3000])
+Input IDs shape: torch.Size([1, 59])
+
+======================================================================
+DETAILED OPERATOR PROFILING (TORCH)
+======================================================================
+
+[1/4] Profiling Audio Encoder...
+  Audio Encoder: 1300.55ms (+/- 1093.75ms)
+
+[2/4] Profiling Multi-modal Projector...
+  Projector: 13.71ms (+/- 16.49ms)
+
+[3/4] Profiling Text Decoder (Prefill)...
+  Decoder Prefill: 711.36ms (+/- 953.38ms)
+
+[4/4] Profiling Decode Steps...
+  Decode Step (avg): 35.44ms (+/- 4.24ms)
+
+[5] Profiling Individual Decoder Layers...
+  Layer 0: 1.87ms (+/- 0.03ms)
+  Layer 1: 1.86ms (+/- 0.01ms)
+  Layer 2: 1.86ms (+/- 0.01ms)
+  Layer 3: 1.85ms (+/- 0.01ms)
+  Layer 4: 1.85ms (+/- 0.01ms)
+
+======================================================================
+PERFORMANCE SUMMARY
+======================================================================
+
+Component                              Time (ms)   % of Total
+------------------------------------------------------------
+Audio Encoder                          1300.55ms       34.2%
+Multi-modal Projector                    13.71ms        0.4%
+Decoder (Prefill)                       711.36ms       18.7%
+Decoder (50 decode steps)              1772.16ms       46.7%
+------------------------------------------------------------
+TOTAL (estimated for 50 tokens)        3797.79ms
+
+
+
+----------------------------------------------------------------------------
+Now continue with the Example
+
+
+First RUN:
+
+(edin-mls-26-spring) root@bc5e6a118e37:~/edin-mls-26-spring/hw1-asr# ./benchmark_detailed.sh glm_asr_triton_example
+======================================================================
+GLM-ASR Detailed Operator Profiling
+======================================================================
+
+Loading test audio...
+Audio: 3.50s @ 16000Hz
+
+Loading model from glm_asr_triton_example...
+Loading HuggingFace model: zai-org/GLM-ASR-Nano-2512
+Creating Triton model with config:
+  Audio: hidden=1280, heads=20, layers=32
+  Text: hidden=2048, heads=16, kv_heads=4, layers=28
+Loading HuggingFace weights...
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights: 100%|█| 745/745 [00:04<00:00, 161.29it/s, Materializing param=mul
+Loading audio encoder weights...
+Loading multi-modal projector weights...
+Loading text decoder weights...
+Weight loading complete!
+Input features shape: torch.Size([1, 128, 3000])
+Input IDs shape: torch.Size([1, 59])
+
+======================================================================
+DETAILED OPERATOR PROFILING (TORCH)
+======================================================================
+
+[1/4] Profiling Audio Encoder...
+  Audio Encoder: 862.72ms (+/- 472.91ms)
+
+[2/4] Profiling Multi-modal Projector...
+  Projector: 19.04ms (+/- 24.01ms)
+
+[3/4] Profiling Text Decoder (Prefill)...
+  Decoder Prefill: 744.70ms (+/- 991.52ms)
+
+[4/4] Profiling Decode Steps...
+  Decode Step (avg): 38.15ms (+/- 3.01ms)
+
+[5] Profiling Individual Decoder Layers...
+  Layer 0: 2.12ms (+/- 0.05ms)
+  Layer 1: 2.12ms (+/- 0.08ms)
+  Layer 2: 1.99ms (+/- 0.02ms)
+  Layer 3: 2.01ms (+/- 0.03ms)
+  Layer 4: 2.07ms (+/- 0.02ms)
+
+======================================================================
+PERFORMANCE SUMMARY
+======================================================================
+
+Component                              Time (ms)   % of Total
+------------------------------------------------------------
+Audio Encoder                           862.72ms       24.4%
+Multi-modal Projector                    19.04ms        0.5%
+Decoder (Prefill)                       744.70ms       21.1%
+Decoder (50 decode steps)              1907.74ms       54.0%
+------------------------------------------------------------
+TOTAL (estimated for 50 tokens)        3534.19ms
+
+
+Second RUN:
+(edin-mls-26-spring) root@bc5e6a118e37:~/edin-mls-26-spring/hw1-asr# ./benchmark_detailed.sh glm_asr_triton_example
+======================================================================
+GLM-ASR Detailed Operator Profiling
+======================================================================
+
+Loading test audio...
+Audio: 3.50s @ 16000Hz
+
+Loading model from glm_asr_triton_example...
+Loading HuggingFace model: zai-org/GLM-ASR-Nano-2512
+Creating Triton model with config:
+  Audio: hidden=1280, heads=20, layers=32
+  Text: hidden=2048, heads=16, kv_heads=4, layers=28
+Loading HuggingFace weights...
+Loading weights: 100%|█| 745/745 [00:04<00:00, 154.48it/s, Materializing param=mul
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading audio encoder weights...
+Loading multi-modal projector weights...
+Loading text decoder weights...
+Weight loading complete!
+Input features shape: torch.Size([1, 128, 3000])
+Input IDs shape: torch.Size([1, 59])
+
+======================================================================
+DETAILED OPERATOR PROFILING (TORCH)
+======================================================================
+
+[1/4] Profiling Audio Encoder...
+  Audio Encoder: 900.75ms (+/- 526.39ms)
+
+[2/4] Profiling Multi-modal Projector...
+  Projector: 15.37ms (+/- 18.83ms)
+
+[3/4] Profiling Text Decoder (Prefill)...
+  Decoder Prefill: 693.70ms (+/- 928.50ms)
+
+[4/4] Profiling Decode Steps...
+  Decode Step (avg): 35.57ms (+/- 4.38ms)
+
+[5] Profiling Individual Decoder Layers...
+  Layer 0: 1.87ms (+/- 0.03ms)
+  Layer 1: 1.86ms (+/- 0.01ms)
+  Layer 2: 1.85ms (+/- 0.01ms)
+  Layer 3: 1.91ms (+/- 0.07ms)
+  Layer 4: 1.86ms (+/- 0.01ms)
+
+======================================================================
+PERFORMANCE SUMMARY
+======================================================================
+
+Component                              Time (ms)   % of Total
+------------------------------------------------------------
+Audio Encoder                           900.75ms       26.6%
+Multi-modal Projector                    15.37ms        0.5%
+Decoder (Prefill)                       693.70ms       20.5%
+Decoder (50 decode steps)              1778.25ms       52.5%
+------------------------------------------------------------
+TOTAL (estimated for 50 tokens)        3388.07ms
+
+
+Third RUN:
+(edin-mls-26-spring) root@bc5e6a118e37:~/edin-mls-26-spring/hw1-asr# ./benchmark_detailed.sh glm_asr_triton_example
+======================================================================
+GLM-ASR Detailed Operator Profiling
+======================================================================
+
+Loading test audio...
+Audio: 3.50s @ 16000Hz
+
+Loading model from glm_asr_triton_example...
+Loading HuggingFace model: zai-org/GLM-ASR-Nano-2512
+Creating Triton model with config:
+  Audio: hidden=1280, heads=20, layers=32
+  Text: hidden=2048, heads=16, kv_heads=4, layers=28
+Loading HuggingFace weights...
+Loading weights: 100%|█| 745/745 [00:04<00:00, 157.72it/s, Materializing param=mul
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading audio encoder weights...
+Loading multi-modal projector weights...
+Loading text decoder weights...
+Weight loading complete!
+Input features shape: torch.Size([1, 128, 3000])
+Input IDs shape: torch.Size([1, 59])
+
+======================================================================
+DETAILED OPERATOR PROFILING (TORCH)
+======================================================================
+
+[1/4] Profiling Audio Encoder...
+  Audio Encoder: 918.23ms (+/- 551.62ms)
+
+[2/4] Profiling Multi-modal Projector...
+  Projector: 16.07ms (+/- 19.78ms)
+
+[3/4] Profiling Text Decoder (Prefill)...
+  Decoder Prefill: 728.60ms (+/- 977.86ms)
+
+[4/4] Profiling Decode Steps...
+  Decode Step (avg): 34.16ms (+/- 2.79ms)
+
+[5] Profiling Individual Decoder Layers...
+  Layer 0: 1.88ms (+/- 0.04ms)
+  Layer 1: 1.85ms (+/- 0.01ms)
+  Layer 2: 1.87ms (+/- 0.03ms)
+  Layer 3: 1.86ms (+/- 0.02ms)
+  Layer 4: 1.85ms (+/- 0.00ms)
+
+======================================================================
+PERFORMANCE SUMMARY
+======================================================================
+
+Component                              Time (ms)   % of Total
+------------------------------------------------------------
+Audio Encoder                           918.23ms       27.2%
+Multi-modal Projector                    16.07ms        0.5%
+Decoder (Prefill)                       728.60ms       21.6%
+Decoder (50 decode steps)              1707.98ms       50.7%
+------------------------------------------------------------
+TOTAL (estimated for 50 tokens)        3370.87ms
+
+
+
+
+
+(edin-mls-26-spring) root@bc5e6a118e37:~/edin-mls-26-spring/hw1-asr# python benchmark_student.py glm_asr_triton_example --warmup 2 --runs 3
+======================================================================
+GLM-ASR Student Version Benchmark
+======================================================================
+
+Loading test audio...
+Loaded audio from /root/edin-mls-26-spring/hw1-asr/test_audio.wav
+Audio duration: 3.50s
+Expected: CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS
+
+======================================================================
+Testing: glm_asr_triton_example
+======================================================================
+Applying baseline configuration (example)...
+Loading model from glm_asr_triton_example...
+Loading HuggingFace model: zai-org/GLM-ASR-Nano-2512
+Creating Triton model with config:
+  Audio: hidden=1280, heads=20, layers=32
+  Text: hidden=2048, heads=16, kv_heads=4, layers=28
+Loading HuggingFace weights...
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights: 100%|█| 745/745 [00:04<00:00, 155.42it/s, Materializing param=mul
+Loading audio encoder weights...
+Loading multi-modal projector weights...
+Loading text decoder weights...
+Weight loading complete!
+Using generate function: generate
+Warmup (2 runs)...
+Benchmarking (3 runs)...
+  Run 1: 1202.4ms (13 tokens)
+  Run 2: 1173.9ms (13 tokens)
+  Run 3: 1170.6ms (13 tokens)
+
+======================================================================
+RESULTS
+======================================================================
+Time: 1182.3ms (+/- 14.3ms)
+Tokens: 13
+Speed: 90.95ms/token
+
+Transcription: Concord returned to its place amidst the tents.
+
+Accuracy: 100.0%
+Status: PASS
+(edin-mls-26-spring) root@bc5e6a118e37:~/edin-mls-26-spring/hw1-asr# python benchmark_student.py glm_asr_triton_template --warmup 2 --runs 3
+======================================================================
+GLM-ASR Student Version Benchmark
+======================================================================
+
+Loading test audio...
+Loaded audio from /root/edin-mls-26-spring/hw1-asr/test_audio.wav
+Audio duration: 3.50s
+Expected: CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS
+
+======================================================================
+Testing: glm_asr_triton_template
+======================================================================
+Loading model from glm_asr_triton_template...
+Loading HuggingFace model: zai-org/GLM-ASR-Nano-2512
+Creating Triton model with config:
+  Audio: hidden=1280, heads=20, layers=32
+  Text: hidden=2048, heads=16, kv_heads=4, layers=28
+Loading HuggingFace weights...
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights: 100%|█| 745/745 [00:04<00:00, 170.67it/s, Materializing param=mul
+Loading audio encoder weights...
+Loading multi-modal projector weights...
+Loading text decoder weights...
+Weight loading complete!
+Using generate function: generate
+Warmup (2 runs)...
+Benchmarking (3 runs)...
+  Run 1: 1069.1ms (13 tokens)
+  Run 2: 1082.3ms (13 tokens)
+  Run 3: 1065.3ms (13 tokens)
+
+======================================================================
+RESULTS
+======================================================================
+Time: 1072.2ms (+/- 7.3ms)
+Tokens: 13
+Speed: 82.48ms/token
+
+Transcription: Concord returned to its place amidst the tents.
+
+Accuracy: 100.0%
+Status: PASS
+(edin-mls-26-spring) root@bc5e6a118e37:~/edin-mls-26-spring/hw1-asr# 
